@@ -1,0 +1,17 @@
+{
+  "name": "Song",
+  "id": "song",
+  "version": "0.1.0",
+  "description": "Arrange scenes on a timeline",
+  "category": "music",
+  "icon": "song.png",
+  "component_path": "components/crosspad-song",
+  "platforms": ["esp-idf", "pc"],
+  "requires": {
+    "crosspad-core": ">=0.3.0",
+    "crosspad-gui": ">=0.2.0"
+  },
+  "changelog": [
+    "0.1.0: Generated from the CrossPad app template"
+  ]
+}
