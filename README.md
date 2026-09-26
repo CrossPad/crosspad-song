@@ -8,8 +8,7 @@ Generated from the [CrossPad app template](https://github.com/CrossPad/crosspad-
 
 | Path | Purpose |
 |------|---------|
-| `src/SongApp.cpp` | UI, animation timer, LVGL buttons + slider, `REGISTER_APP_PL` |
-| `src/SongPadLogic.cpp` | Pad handler — records events for the GUI thread |
+| `src/SongApp.cpp` | The song timeline: sequencer scenes as blocks with repeats, song mode, loop, locate; `REGISTER_APP` (no pad logic — the pads stay the Sampler's) |
 | `CMakeLists.txt` | ESP-IDF component; the PC simulator globs `src/` itself |
 | `crosspad-app.json` | Registry metadata (name, id, platforms, requirements) |
 
