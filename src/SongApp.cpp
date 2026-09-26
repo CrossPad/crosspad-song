@@ -358,8 +358,10 @@ void play_cb(lv_event_t*)
         sq->stop();                          // ends song mode too
     } else if (sq->getSongLength()) {
         if (sq->getState() == crosspad::SequencerState::Running) sq->stop();
-        sq->songLocate(s_sel);               // from the selected block
+        /* Song mode first: switched on while stopped it locates the first
+         * block, which would undo the locate. */
         sq->setSongMode(true);
+        sq->songLocate(s_sel);               // from the selected block
         sq->playback();
     }
     sync_transport();
