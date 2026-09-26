@@ -1,20 +1,23 @@
 /**
  * @file SongApp.cpp
- * @brief Song — generated from the CrossPad app template.
+ * @brief Song -- the kit's scenes arranged on a timeline.
  *
- * A deliberately small but complete app, meant to be read and then rewritten:
+ * A song is a row of blocks, each a scene played a number of times in a row:
+ * "Seq 1 x4, Seq 2 x4, Seq 1 x2, Seq 3 x1". It is drawn the way a linear DAW
+ * draws an arrangement: a bar ruler, and every block as wide as it plays --
+ * repeats times the scene's own bar count -- in its scene's colour, with a
+ * playhead running across while it plays.
  *
- *   - an aquarium of ASCII fish animated by an lv_timer,
- *   - LVGL buttons and a slider driving it,
- *   - a pad handler that spawns fish, wired declaratively via REGISTER_APP_PL.
+ * The arrangement lives in the sequencer (crosspad-core) and is saved with the
+ * kit's sequences; this app only draws and edits it. Play here is song mode:
+ * the sequencer walks the blocks, changing scene on the bar line. Stop ends
+ * song mode, so the Sampler's own Play keeps meaning "loop this scene".
  *
- * The one rule worth copying: pad callbacks run on the pad thread, LVGL does
- * not tolerate that, so SongPadLogic only records events and the LVGL
- * timer below does every drawing call.
+ * The pads stay the Sampler's: no pad logic of its own, so they play the kit
+ * while the song runs.
  */
 
 #include "crosspad-song/SongApp.hpp"
-#include "crosspad-song/SongPadLogic.hpp"
 
 // `class App` lives in a different header per platform, but both derive from
 // crosspad_gui::AppBase<App>, so the lifecycle calls used here are identical.
@@ -25,15 +28,15 @@
 #endif
 
 #include "crosspad/app/AppRegistrar.hpp"
-#include "crosspad/pad/PadManager.hpp"
 #include "crosspad/platform/PlatformServices.hpp"
+#include "crosspad/sequencer/SequencerController.hpp"
+#include "crosspad-gui/widgets/gui_helpers.h"
 
 #include "lvgl.h"
 
 #include <cstdio>
-#include <memory>
 
-// Encoder navigation is an embedded-only concern — the simulator drives the UI
+// Encoder navigation is an embedded-only concern -- the simulator drives the UI
 // with a pointer. Snapshot whichever group was active before the app opened and
 // restore that, rather than a global launcher group that goes stale whenever the
 // launcher is rebuilt.
@@ -46,123 +49,368 @@ extern "C" {
 
 namespace {
 
-constexpr int kMaxFish = 12;
-constexpr int kStartFish = 5;
-constexpr uint32_t kTickMs = 33;          // ~30 fps
-constexpr const char* kFishRight = "><>";
-constexpr const char* kFishLeft = "<><";
+constexpr int32_t  kPxPerBar  = 12;
+constexpr int32_t  kRulerH    = 12;
+constexpr int32_t  kBlockH    = 58;
+constexpr int32_t  kBlockGap  = 2;
+constexpr uint32_t kTickMs    = 50;
+constexpr uint8_t  kMaxBlocks = 32;
 
-struct Fish {
-    lv_obj_t* label = nullptr;
-    int32_t x10 = 0;      // position in tenths of a pixel — integer math only
-    int32_t y = 0;
-    int32_t vx10 = 10;    // tenths of a pixel per tick, sign = direction
-    int32_t phase = 0;    // bobbing phase
+const lv_color_t kBg      = lv_color_hex(0x16181B);
+const lv_color_t kPanel   = lv_color_hex(0x20242A);
+const lv_color_t kInk     = lv_color_hex(0x16181B);
+const lv_color_t kText    = lv_color_hex(0xE8EAED);
+const lv_color_t kDim     = lv_color_hex(0x7B828B);
+const lv_color_t kAccent  = lv_color_hex(0xC6FF47);
+const lv_color_t kHead    = lv_color_hex(0xFFFFFF);
+
+/// A scene's colour, the same for every block of it, so a repeat of Seq 1
+/// reads as Seq 1 at a glance anywhere on the timeline.
+const uint32_t kSceneColors[] = {
+    0xC6FF47, 0x5AC8FF, 0xFFC857, 0xFF7A9A, 0xB48CFF, 0xFF9552, 0x4FE0B0, 0x7AA2FF,
 };
 
-Fish s_fish[kMaxFish];
-int s_fishCount = 0;
+lv_obj_t* s_root      = nullptr;
+lv_obj_t* s_timeline  = nullptr;   // scrolls horizontally: ruler, blocks, playhead
+lv_obj_t* s_playhead  = nullptr;
+lv_obj_t* s_posLabel  = nullptr;
+lv_obj_t* s_infoLabel = nullptr;
+lv_obj_t* s_playBtn   = nullptr;
+lv_obj_t* s_playLabel = nullptr;
+lv_obj_t* s_loopBtn   = nullptr;
+lv_obj_t* s_blocks[kMaxBlocks] = {};
+lv_obj_t* s_tools[6] = {};
+lv_obj_t* s_backBtn   = nullptr;
+lv_timer_t* s_timer   = nullptr;
 
-lv_obj_t* s_root = nullptr;
-lv_obj_t* s_tank = nullptr;
-lv_obj_t* s_countLabel = nullptr;
-lv_timer_t* s_timer = nullptr;
-int32_t s_speedPct = 50;
-
-std::shared_ptr<SongPadLogic> s_padLogic;
+uint8_t  s_sel = 0;
+uint32_t s_shape = 0;      // what the timeline was last built from
+int      s_playing = -1;   // block drawn as playing, -1 none
 
 #ifdef SONG_USE_ENCODER
 lv_group_t* s_encGroup = nullptr;
 lv_group_t* s_prevEncGroup = nullptr;
 #endif
 
-const lv_color_t kFishColors[] = {
-    lv_color_hex(0xffb347), lv_color_hex(0x7ec8e3), lv_color_hex(0xf78fb3),
-    lv_color_hex(0xa0e7a0), lv_color_hex(0xffe066), lv_color_hex(0xc3a6ff),
-};
-constexpr int kFishColorCount = sizeof(kFishColors) / sizeof(kFishColors[0]);
-
-int32_t tank_w() { return s_tank ? lv_obj_get_width(s_tank) : 300; }
-int32_t tank_h() { return s_tank ? lv_obj_get_height(s_tank) : 120; }
-
-void update_count_label()
+crosspad::SequencerController* seq()
 {
-    if (!s_countLabel) return;
-    lv_label_set_text_fmt(s_countLabel, "%d fish", s_fishCount);
+    return crosspad::getPlatformServices().sequencer;
 }
 
-void spawn_fish(int32_t speedBias)
+struct Block { uint8_t scene = 0, repeats = 1, bars = 1; };
+
+bool block_at(uint8_t i, Block& b)
 {
-    if (!s_tank || s_fishCount >= kMaxFish) return;
-
-    Fish& f = s_fish[s_fishCount];
-    f.label = lv_label_create(s_tank);
-    lv_obj_set_style_text_color(f.label, kFishColors[s_fishCount % kFishColorCount], 0);
-
-    const bool toRight = (s_fishCount % 2) == 0;
-    lv_label_set_text(f.label, toRight ? kFishRight : kFishLeft);
-
-    const int32_t h = tank_h();
-    const int32_t w = tank_w();
-    // Stagger both axes so a fresh tank does not look like a single school
-    // swimming in formation.
-    f.x10 = (toRight ? 0 : w * 10) + (s_fishCount * 37 % (w > 40 ? w : 40)) * 10
-            * (toRight ? 1 : -1);
-    f.y = h > 24 ? (s_fishCount * 19) % (h - 16) : 0;
-    f.vx10 = (toRight ? 1 : -1) * (6 + speedBias);
-    f.phase = s_fishCount * 40;
-
-    lv_obj_set_pos(f.label, f.x10 / 10, f.y);
-    ++s_fishCount;
-    update_count_label();
+    auto* sq = seq();
+    if (!sq || !sq->getSongBlock(i, b.scene, b.repeats)) return false;
+    b.bars = sq->getSceneBars(b.scene);
+    if (!b.bars) b.bars = 1;
+    return true;
 }
 
-void remove_fish()
+int32_t block_bars(const Block& b) { return (int32_t)b.repeats * b.bars; }
+
+/// Everything the drawing depends on, folded into one word: when it changes
+/// -- an edit here, a kit load, a scene's length changed in the Sampler --
+/// the timeline is rebuilt.
+uint32_t song_shape()
 {
-    if (s_fishCount <= 0) return;
-    --s_fishCount;
-    if (s_fish[s_fishCount].label) {
-        lv_obj_delete(s_fish[s_fishCount].label);
-        s_fish[s_fishCount].label = nullptr;
+    auto* sq = seq();
+    if (!sq) return 0;
+    uint32_t h = 2166136261u;
+    auto mix = [&](uint32_t v) { h = (h ^ v) * 16777619u; };
+    mix(sq->getSongLength());
+    mix(sq->getSceneCount());
+    for (uint8_t i = 0; i < sq->getSongLength(); ++i) {
+        Block b;
+        block_at(i, b);
+        mix(((uint32_t)b.scene << 16) | ((uint32_t)b.repeats << 8) | b.bars);
     }
-    update_count_label();
+    return h;
 }
 
-// Triangle-wave bob: no float, no trig table, and close enough to a swim.
-int32_t bob(int32_t phase)
+void update_info()
 {
-    const int32_t p = phase % 120;
-    return (p < 60 ? p : 120 - p) / 15;   // 0..4 px
+    auto* sq = seq();
+    if (!sq || !s_infoLabel) return;
+    const uint8_t n = sq->getSongLength();
+    int32_t total = 0;
+    for (uint8_t i = 0; i < n; ++i) { Block b; block_at(i, b); total += block_bars(b); }
+    Block b;
+    if (n && block_at(s_sel, b)) {
+        lv_label_set_text_fmt(s_infoLabel, "Block %u  -  Seq %u x%u  -  %d bars   |   song %d bars",
+                              (unsigned)(s_sel + 1), (unsigned)(b.scene + 1), (unsigned)b.repeats,
+                              (int)block_bars(b), (int)total);
+    } else {
+        lv_label_set_text(s_infoLabel, "Empty song -- ADD puts the first block in");
+    }
+}
+
+void paint_block(uint8_t i)
+{
+    lv_obj_t* o = s_blocks[i];
+    if (!o) return;
+    const bool sel = i == s_sel;
+    const bool playing = (int)i == s_playing;
+    lv_obj_set_style_outline_width(o, sel ? 2 : 0, 0);
+    lv_obj_set_style_outline_color(o, kHead, 0);
+    lv_obj_set_style_outline_pad(o, 1, 0);
+    lv_obj_set_style_bg_opa(o, playing ? LV_OPA_COVER : LV_OPA_80, 0);
+    lv_obj_set_style_border_width(o, playing ? 3 : 0, 0);
+    lv_obj_set_style_border_side(o, LV_BORDER_SIDE_TOP, 0);
+    lv_obj_set_style_border_color(o, kHead, 0);
+}
+
+void select_block(uint8_t i)
+{
+    auto* sq = seq();
+    const uint8_t n = sq ? sq->getSongLength() : 0;
+    if (!n) { s_sel = 0; update_info(); return; }
+    if (i >= n) i = (uint8_t)(n - 1);
+    const uint8_t prev = s_sel;
+    s_sel = i;
+    if (prev < n) paint_block(prev);
+    paint_block(i);
+    if (s_blocks[i]) lv_obj_scroll_to_view(s_blocks[i], LV_ANIM_ON);
+    update_info();
+}
+
+void block_focused_cb(lv_event_t* e)
+{
+    select_block((uint8_t)(uintptr_t)lv_event_get_user_data(e));
+}
+
+/// The encoder group in screen order: top bar, blocks left to right, tools.
+/// Rebuilt with the blocks, since a group only ever appends.
+void rebuild_group()
+{
+#ifdef SONG_USE_ENCODER
+    if (!s_encGroup) return;
+    lv_obj_t* focused = lv_group_get_focused(s_encGroup);
+    lv_group_remove_all_objs(s_encGroup);
+    lv_group_add_obj(s_encGroup, s_backBtn);
+    lv_group_add_obj(s_encGroup, s_loopBtn);
+    lv_group_add_obj(s_encGroup, s_playBtn);
+    for (auto* b : s_blocks) if (b) lv_group_add_obj(s_encGroup, b);
+    for (auto* t : s_tools) if (t) lv_group_add_obj(s_encGroup, t);
+    /* Keep the cursor where it was; on a block that just went, the new
+     * selection. */
+    bool alive = false;
+    for (uint32_t k = 0; k < lv_group_get_obj_count(s_encGroup); ++k) {
+        if (lv_group_get_obj_by_index(s_encGroup, k) == focused) { alive = true; break; }
+    }
+    if (alive) lv_group_focus_obj(focused);
+    else if (s_blocks[s_sel]) lv_group_focus_obj(s_blocks[s_sel]);
+#endif
+}
+
+void rebuild_timeline()
+{
+    auto* sq = seq();
+    if (!s_timeline || !sq) return;
+
+    lv_obj_clean(s_timeline);
+    for (auto& b : s_blocks) b = nullptr;
+    s_playhead = nullptr;
+    s_playing = -1;
+
+    const uint8_t n = sq->getSongLength();
+    int32_t x = 0;
+    for (uint8_t i = 0; i < n && i < kMaxBlocks; ++i) {
+        Block b;
+        if (!block_at(i, b)) break;
+        const int32_t w = block_bars(b) * kPxPerBar;
+
+        lv_obj_t* o = lv_obj_create(s_timeline);
+        lv_obj_remove_style_all(o);
+        lv_obj_set_pos(o, x, kRulerH + 2);
+        lv_obj_set_size(o, w - kBlockGap, kBlockH);
+        lv_obj_set_style_radius(o, 4, 0);
+        lv_obj_set_style_bg_color(o, lv_color_hex(kSceneColors[b.scene % 8]), 0);
+        lv_obj_set_style_pad_all(o, 3, 0);
+        lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(o, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(o, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+        lv_obj_add_event_cb(o, block_focused_cb, LV_EVENT_FOCUSED, (void*)(uintptr_t)i);
+        lv_obj_add_event_cb(o, block_focused_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)i);
+
+        /* Scene over repeats, top-left, clipped when the block is short. */
+        lv_obj_t* l = lv_label_create(o);
+        lv_obj_set_style_text_font(l, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(l, kInk, 0);
+        lv_label_set_long_mode(l, LV_LABEL_LONG_CLIP);
+        lv_obj_set_width(l, LV_PCT(100));
+        lv_label_set_text_fmt(l, "S%u\nx%u", (unsigned)(b.scene + 1), (unsigned)b.repeats);
+
+        /* A tick per pass, so x4 looks like four of something. */
+        for (uint8_t r = 1; r < b.repeats; ++r) {
+            lv_obj_t* t = lv_obj_create(o);
+            lv_obj_remove_style_all(t);
+            lv_obj_set_size(t, 1, 10);
+            lv_obj_set_style_bg_color(t, kInk, 0);
+            lv_obj_set_style_bg_opa(t, LV_OPA_40, 0);
+            lv_obj_align(t, LV_ALIGN_BOTTOM_LEFT, r * b.bars * kPxPerBar - 3, 3);
+        }
+
+        s_blocks[i] = o;
+        x += w;
+    }
+
+    /* Ruler: a number every four bars, a tick every bar, across the song and
+     * a little past it so the end is visible as an end. */
+    const int32_t bars = x / kPxPerBar + 8;
+    for (int32_t bar = 0; bar < bars; ++bar) {
+        lv_obj_t* t = lv_obj_create(s_timeline);
+        lv_obj_remove_style_all(t);
+        lv_obj_set_size(t, 1, bar % 4 ? 3 : 6);
+        lv_obj_set_style_bg_color(t, kDim, 0);
+        lv_obj_set_style_bg_opa(t, LV_OPA_COVER, 0);
+        lv_obj_set_pos(t, bar * kPxPerBar, kRulerH - (bar % 4 ? 3 : 6));
+        if (bar % 4 == 0) {
+            lv_obj_t* num = lv_label_create(s_timeline);
+            lv_obj_set_style_text_font(num, &lv_font_montserrat_10, 0);
+            lv_obj_set_style_text_color(num, kDim, 0);
+            lv_label_set_text_fmt(num, "%d", (int)(bar + 1));
+            lv_obj_set_pos(num, bar * kPxPerBar + 2, -2);
+        }
+    }
+
+    s_playhead = lv_obj_create(s_timeline);
+    lv_obj_remove_style_all(s_playhead);
+    lv_obj_set_size(s_playhead, 2, kRulerH + kBlockH + 4);
+    lv_obj_set_style_bg_color(s_playhead, kHead, 0);
+    lv_obj_set_style_bg_opa(s_playhead, LV_OPA_COVER, 0);
+    lv_obj_add_flag(s_playhead, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(s_playhead, LV_OBJ_FLAG_CLICKABLE);
+
+    s_shape = song_shape();
+    rebuild_group();
+    select_block(s_sel);
+}
+
+void sync_transport()
+{
+    auto* sq = seq();
+    if (!sq) return;
+    const bool running = sq->getState() == crosspad::SequencerState::Running;
+    const bool song = running && sq->getSongMode();
+    lv_label_set_text(s_playLabel, song ? LV_SYMBOL_STOP : LV_SYMBOL_PLAY);
+    lv_obj_set_style_bg_color(s_playBtn, song ? kAccent : kPanel, 0);
+    lv_obj_set_style_text_color(s_playLabel, song ? kInk : kText, 0);
+    const bool loop = sq->getSongLoop();
+    lv_obj_set_style_bg_color(s_loopBtn, loop ? kAccent : kPanel, 0);
+    lv_obj_set_style_text_color(lv_obj_get_child(s_loopBtn, 0), loop ? kInk : kDim, 0);
 }
 
 void tick_cb(lv_timer_t*)
 {
-    // Drain pad presses recorded on the pad thread.
-    if (s_padLogic) {
-        int pending = s_padLogic->takePendingSpawns();
-        const int32_t bias = s_padLogic->lastVelocity() / 24;   // 0..5
-        while (pending-- > 0) spawn_fish(bias);
+    auto* sq = seq();
+    if (!sq) return;
+    if (song_shape() != s_shape) rebuild_timeline();
+    sync_transport();
+
+    const bool playing = sq->getState() == crosspad::SequencerState::Running && sq->getSongMode();
+    const int now = playing ? sq->getSongPosition() : -1;
+    if (now != s_playing) {
+        const int was = s_playing;
+        s_playing = now;
+        if (was >= 0 && was < kMaxBlocks) paint_block((uint8_t)was);
+        if (now >= 0 && now < kMaxBlocks) paint_block((uint8_t)now);
     }
 
-    const int32_t w = tank_w();
-    for (int i = 0; i < s_fishCount; ++i) {
-        Fish& f = s_fish[i];
-        if (!f.label) continue;
-
-        f.x10 += (f.vx10 * s_speedPct) / 50;
-        f.phase += 3;
-
-        // Wrap around and flip the fish so it always faces where it swims.
-        if (f.vx10 > 0 && f.x10 / 10 > w) {
-            f.x10 = -30 * 10;
-            lv_label_set_text(f.label, kFishRight);
-        } else if (f.vx10 < 0 && f.x10 / 10 < -30) {
-            f.x10 = (w + 10) * 10;
-            lv_label_set_text(f.label, kFishLeft);
+    int32_t total = 0, at = 0;
+    for (uint8_t i = 0; i < sq->getSongLength(); ++i) {
+        Block b;
+        block_at(i, b);
+        if ((int)i < now) at += block_bars(b);
+        if ((int)i == now) {
+            const float into = (float)sq->getSongPass() * b.bars + sq->getProgress() * b.bars;
+            at = at * kPxPerBar + (int32_t)(into * kPxPerBar);
         }
-
-        lv_obj_set_pos(f.label, f.x10 / 10, f.y + bob(f.phase));
+        total += block_bars(b);
     }
+
+    if (!s_playhead) return;
+    if (!playing) {
+        lv_obj_add_flag(s_playhead, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text_fmt(s_posLabel, "%d bars", (int)total);
+        return;
+    }
+    lv_obj_remove_flag(s_playhead, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_pos(s_playhead, at, 0);
+    lv_label_set_text_fmt(s_posLabel, "bar %d / %d", (int)(at / kPxPerBar + 1), (int)total);
+
+    /* Follow the playhead: once it passes two thirds of the view, page on. */
+    const int32_t view = lv_obj_get_content_width(s_timeline);
+    const int32_t left = lv_obj_get_scroll_x(s_timeline);
+    if (at < left || at > left + view * 2 / 3) {
+        lv_obj_scroll_to_x(s_timeline, at > view / 3 ? at - view / 3 : 0, LV_ANIM_ON);
+    }
+}
+
+// ── actions ────────────────────────────────────────────────────────────────
+
+void play_cb(lv_event_t*)
+{
+    auto* sq = seq();
+    if (!sq) return;
+    if (sq->getState() == crosspad::SequencerState::Running && sq->getSongMode()) {
+        sq->stop();                          // ends song mode too
+    } else if (sq->getSongLength()) {
+        if (sq->getState() == crosspad::SequencerState::Running) sq->stop();
+        sq->songLocate(s_sel);               // from the selected block
+        sq->setSongMode(true);
+        sq->playback();
+    }
+    sync_transport();
+}
+
+void loop_cb(lv_event_t*)
+{
+    if (auto* sq = seq()) sq->setSongLoop(!sq->getSongLoop());
+    sync_transport();
+}
+
+void edit_selected(int dScene, int dRepeats)
+{
+    auto* sq = seq();
+    Block b;
+    if (!sq || !block_at(s_sel, b)) return;
+    const int scenes = sq->getSceneCount() ? sq->getSceneCount() : 1;
+    const int scene = ((int)b.scene + dScene + scenes) % scenes;
+    int reps = (int)b.repeats + dRepeats;
+    if (reps < 1) reps = 1;
+    if (reps > 16) reps = 16;
+    sq->songSet(s_sel, (uint8_t)scene, (uint8_t)reps);
+    rebuild_timeline();
+}
+
+void scene_down_cb(lv_event_t*) { edit_selected(-1, 0); }
+void scene_up_cb(lv_event_t*)   { edit_selected(+1, 0); }
+void reps_down_cb(lv_event_t*)  { edit_selected(0, -1); }
+void reps_up_cb(lv_event_t*)    { edit_selected(0, +1); }
+
+/// After the selected block, the same scene once: the next part of a song is
+/// most often more of the same, and it is one press to change.
+void add_cb(lv_event_t*)
+{
+    auto* sq = seq();
+    if (!sq) return;
+    const uint8_t n = sq->getSongLength();
+    Block b;
+    const uint8_t scene = (n && block_at(s_sel, b)) ? b.scene : 0;
+    const uint8_t at = n ? (uint8_t)(s_sel + 1) : 0;
+    if (sq->songInsert(at, scene, 1)) s_sel = at;
+    rebuild_timeline();
+}
+
+void del_cb(lv_event_t*)
+{
+    auto* sq = seq();
+    if (!sq || !sq->getSongLength()) return;
+    sq->songRemove(s_sel);
+    if (s_sel && s_sel >= sq->getSongLength()) --s_sel;
+    rebuild_timeline();
 }
 
 // Closing the app from inside the app. Never call destroyApp() straight from
@@ -173,39 +421,35 @@ void back_cb(lv_event_t* e)
     if (app) app->destroyAppAsync();
 }
 
-void add_cb(lv_event_t*)    { spawn_fish(2); }
-void remove_cb(lv_event_t*) { remove_fish(); }
-
-// "Feed" makes every fish dart and flashes the pads — one call into the
-// portable PadManager, so it behaves the same on hardware and in the simulator.
-void feed_cb(lv_event_t*)
+lv_obj_t* make_button(lv_obj_t* parent, int32_t w, const char* text, lv_event_cb_t cb, void* ud = nullptr)
 {
-    for (int i = 0; i < s_fishCount; ++i) {
-        s_fish[i].vx10 += (s_fish[i].vx10 > 0 ? 6 : -6);
-    }
-    auto& pads = crosspad::getPadManager();
-    for (uint8_t i = 0; i < 16; ++i) {
-        pads.setPadColor(i, 255, 200, 40);
-    }
+    lv_obj_t* b = lv_button_create(parent);
+    lv_obj_set_size(b, w, 22);
+    lv_obj_set_style_pad_all(b, 0, 0);
+    lv_obj_set_style_radius(b, 6, 0);
+    lv_obj_set_style_shadow_width(b, 0, 0);
+    lv_obj_set_style_bg_color(b, kPanel, 0);
+    lv_obj_set_style_outline_color(b, kHead, LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_outline_width(b, 2, LV_STATE_FOCUS_KEY);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, ud);
+    lv_obj_t* l = lv_label_create(b);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(l, kText, 0);
+    lv_label_set_text(l, text);
+    lv_obj_center(l);
+    return b;
 }
 
-void speed_cb(lv_event_t* e)
+lv_obj_t* make_row(lv_obj_t* parent, int32_t h)
 {
-    auto* slider = static_cast<lv_obj_t*>(lv_event_get_target(e));
-    s_speedPct = lv_slider_get_value(slider);
-}
-
-lv_obj_t* make_button(lv_obj_t* parent, const char* text, lv_event_cb_t cb)
-{
-    lv_obj_t* btn = lv_button_create(parent);
-    lv_obj_set_height(btn, 30);
-    lv_obj_set_flex_grow(btn, 1);
-    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, nullptr);
-
-    lv_obj_t* label = lv_label_create(btn);
-    lv_label_set_text(label, text);
-    lv_obj_center(label);
-    return btn;
+    lv_obj_t* r = lv_obj_create(parent);
+    lv_obj_remove_style_all(r);
+    lv_obj_set_size(r, LV_PCT(100), h);
+    lv_obj_set_flex_flow(r, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(r, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(r, 4, 0);
+    lv_obj_remove_flag(r, LV_OBJ_FLAG_SCROLLABLE);
+    return r;
 }
 
 } // namespace
@@ -220,129 +464,83 @@ lv_obj_t* Song_create(lv_obj_t* parent, App* app)
 
     s_root = lv_obj_create(parent);
     lv_obj_set_size(s_root, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_style_bg_color(s_root, lv_color_hex(0x001018), 0);
+    lv_obj_set_style_bg_color(s_root, kBg, 0);
     lv_obj_set_style_border_width(s_root, 0, 0);
+    lv_obj_set_style_radius(s_root, 0, 0);
     lv_obj_set_style_pad_all(s_root, 6, 0);
+    lv_obj_set_style_pad_row(s_root, 5, 0);
     lv_obj_set_flex_flow(s_root, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(s_root, 6, 0);
     lv_obj_remove_flag(s_root, LV_OBJ_FLAG_SCROLLABLE);
 
-    // -- title bar with the way out --
-    // Every app needs one: the launcher sits underneath, but nothing brings it
-    // back on its own. destroyAppAsync() is the framework's close path — it
-    // defers past this event callback and clears the running-app pointer.
-    lv_obj_t* bar = lv_obj_create(s_root);
-    lv_obj_set_width(bar, LV_PCT(100));
-    lv_obj_set_height(bar, 30);
-    lv_obj_set_style_bg_opa(bar, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(bar, 0, 0);
-    lv_obj_set_style_pad_all(bar, 0, 0);
-    lv_obj_set_style_pad_column(bar, 8, 0);
-    lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(bar, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
-                          LV_FLEX_ALIGN_CENTER);
-    lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t* backBtn = lv_button_create(bar);
-    lv_obj_set_size(backBtn, 62, 26);
-    lv_obj_add_event_cb(backBtn, back_cb, LV_EVENT_CLICKED, app);
-    lv_obj_t* backLabel = lv_label_create(backBtn);
-    lv_label_set_text(backLabel, LV_SYMBOL_LEFT " Back");
-    lv_obj_center(backLabel);
+    // -- top bar: out, what this is, where the song is, loop, play --
+    lv_obj_t* bar = make_row(s_root, 22);
+    s_backBtn = make_button(bar, 30, LV_SYMBOL_LEFT, back_cb, app);
 
     lv_obj_t* title = lv_label_create(bar);
+    lv_obj_set_style_text_color(title, kText, 0);
     lv_label_set_text(title, "Song");
-    lv_obj_set_style_text_color(title, lv_color_hex(0x7ec8e3), 0);
 
-#ifdef SONG_USE_ENCODER
-    // Back joins the group first and keeps focus: with only an encoder, the
-    // way out has to be reachable without hunting through the UI.
-    if (s_encGroup) lv_group_add_obj(s_encGroup, backBtn);
-#endif
+    s_posLabel = lv_label_create(bar);
+    lv_obj_set_style_text_font(s_posLabel, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(s_posLabel, kDim, 0);
+    lv_obj_set_flex_grow(s_posLabel, 1);
+    lv_obj_set_style_text_align(s_posLabel, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_label_set_text(s_posLabel, "");
 
-    // -- aquarium --
-    s_tank = lv_obj_create(s_root);
-    lv_obj_set_width(s_tank, LV_PCT(100));
-    lv_obj_set_flex_grow(s_tank, 1);
-    lv_obj_set_style_bg_color(s_tank, lv_color_hex(0x022b3a), 0);
-    lv_obj_set_style_border_color(s_tank, lv_color_hex(0x0a4d68), 0);
-    lv_obj_set_style_pad_all(s_tank, 0, 0);
-    lv_obj_remove_flag(s_tank, LV_OBJ_FLAG_SCROLLABLE);
+    s_loopBtn = make_button(bar, 40, "LOOP", loop_cb);
+    s_playBtn = make_button(bar, 40, LV_SYMBOL_PLAY, play_cb);
+    s_playLabel = lv_obj_get_child(s_playBtn, 0);
 
-    s_countLabel = lv_label_create(s_root);
-    lv_obj_set_style_text_color(s_countLabel, lv_color_hex(0x7ec8e3), 0);
+    // -- the timeline --
+    s_timeline = lv_obj_create(s_root);
+    lv_obj_remove_style_all(s_timeline);
+    lv_obj_set_width(s_timeline, LV_PCT(100));
+    lv_obj_set_height(s_timeline, kRulerH + kBlockH + 8);
+    lv_obj_set_style_bg_color(s_timeline, kPanel, 0);
+    lv_obj_set_style_bg_opa(s_timeline, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_timeline, 6, 0);
+    lv_obj_set_style_pad_hor(s_timeline, 4, 0);
+    lv_obj_set_style_pad_top(s_timeline, 2, 0);
+    lv_obj_set_scroll_dir(s_timeline, LV_DIR_HOR);
+    lv_obj_set_scrollbar_mode(s_timeline, LV_SCROLLBAR_MODE_OFF);
 
-    // -- buttons --
-    lv_obj_t* row = lv_obj_create(s_root);
-    lv_obj_set_width(row, LV_PCT(100));
-    lv_obj_set_height(row, 38);
-    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(row, 0, 0);
-    lv_obj_set_style_pad_all(row, 0, 0);
-    lv_obj_set_style_pad_column(row, 6, 0);
-    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    s_infoLabel = lv_label_create(s_root);
+    lv_obj_set_style_text_font(s_infoLabel, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(s_infoLabel, kDim, 0);
+    lv_label_set_long_mode(s_infoLabel, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(s_infoLabel, LV_PCT(100));
 
-    lv_obj_t* addBtn = make_button(row, "+ Fish", add_cb);
-    lv_obj_t* remBtn = make_button(row, "- Fish", remove_cb);
-    lv_obj_t* feedBtn = make_button(row, "Feed", feed_cb);
-#ifdef SONG_USE_ENCODER
-    if (s_encGroup) {
-        lv_group_add_obj(s_encGroup, addBtn);
-        lv_group_add_obj(s_encGroup, remBtn);
-        lv_group_add_obj(s_encGroup, feedBtn);
-    }
-#endif
+    // -- tools: act on the selected block --
+    lv_obj_t* tools = make_row(s_root, 26);
+    lv_obj_set_style_pad_column(tools, 3, 0);
+    s_tools[0] = make_button(tools, 46, "S -", scene_down_cb);
+    s_tools[1] = make_button(tools, 46, "S +", scene_up_cb);
+    s_tools[2] = make_button(tools, 46, "x -", reps_down_cb);
+    s_tools[3] = make_button(tools, 46, "x +", reps_up_cb);
+    s_tools[4] = make_button(tools, 50, "ADD", add_cb);
+    s_tools[5] = make_button(tools, 50, "DEL", del_cb);
 
-    // -- speed slider --
-    lv_obj_t* slider = lv_slider_create(s_root);
-    lv_obj_set_width(slider, LV_PCT(100));
-    lv_slider_set_range(slider, 10, 200);
-    lv_slider_set_value(slider, s_speedPct, LV_ANIM_OFF);
-    lv_obj_add_event_cb(slider, speed_cb, LV_EVENT_VALUE_CHANGED, nullptr);
-#ifdef SONG_USE_ENCODER
-    if (s_encGroup) lv_group_add_obj(s_encGroup, slider);
-#endif
-
-    // -- pad logic --
-    // Registration only. Activation is framework-owned: AppBase::start() pushes
-    // the pad logic named in REGISTER_APP_PL and destroyApp() pops it, so this
-    // app must never call setActivePadLogic() itself.
-    if (!s_padLogic) {
-        s_padLogic = std::make_shared<SongPadLogic>();
-        crosspad::getPadManager().registerPadLogic("Song", s_padLogic);
-    }
-
-    // Flex has not run yet, so the tank still reports a size of zero and every
-    // fish would spawn stacked in the top-left corner. Force the layout pass
-    // before asking for its dimensions.
     lv_obj_update_layout(s_root);
-
-    for (int i = 0; i < kStartFish; ++i) spawn_fish(0);
-    update_count_label();
+    rebuild_timeline();
+    sync_transport();
 
 #ifdef SONG_USE_ENCODER
-    if (s_encGroup) lv_group_focus_obj(backBtn);
+    if (s_encGroup) lv_group_focus_obj(s_blocks[s_sel] ? s_blocks[s_sel] : s_playBtn);
 #endif
 
     s_timer = lv_timer_create(tick_cb, kTickMs, nullptr);
 
-    // Animation costs nothing while the app is hidden.
     if (app) {
         app->setOnShow([](lv_obj_t*) {
             if (s_timer) lv_timer_resume(s_timer);
 #ifdef SONG_USE_ENCODER
-            if (indev_encoderTop && s_encGroup) {
-                lv_indev_set_group(indev_encoderTop, s_encGroup);
-            }
+            if (indev_encoderTop && s_encGroup) lv_indev_set_group(indev_encoderTop, s_encGroup);
 #endif
         });
         app->setOnHide([](lv_obj_t*) {
             if (s_timer) lv_timer_pause(s_timer);
 #ifdef SONG_USE_ENCODER
-            if (indev_encoderTop && s_prevEncGroup) {
-                lv_indev_set_group(indev_encoderTop, s_prevEncGroup);
-            }
+            if (indev_encoderTop && s_prevEncGroup) lv_indev_restore_group(indev_encoderTop, s_prevEncGroup);
 #endif
         });
     }
@@ -356,20 +554,16 @@ void Song_destroy(lv_obj_t* root)
         lv_timer_delete(s_timer);
         s_timer = nullptr;
     }
-    // The fish are children of the tank, which is a child of root: deleting
-    // root takes them with it. Only the bookkeeping needs clearing.
-    for (auto& f : s_fish) f.label = nullptr;
-    s_fishCount = 0;
-    s_tank = nullptr;
-    s_countLabel = nullptr;
-    s_root = nullptr;
+    for (auto& b : s_blocks) b = nullptr;
+    for (auto& t : s_tools) t = nullptr;
+    s_root = s_timeline = s_playhead = s_posLabel = s_infoLabel = nullptr;
+    s_playBtn = s_playLabel = s_loopBtn = s_backBtn = nullptr;
+    s_playing = -1;
 
 #ifdef SONG_USE_ENCODER
     // Hand navigation back before the group dies, or the launcher comes back
     // unnavigable and only a reboot fixes it.
-    if (indev_encoderTop && s_prevEncGroup) {
-        lv_indev_set_group(indev_encoderTop, s_prevEncGroup);
-    }
+    if (indev_encoderTop && s_prevEncGroup) lv_indev_restore_group(indev_encoderTop, s_prevEncGroup);
     if (s_encGroup) {
         lv_group_delete(s_encGroup);
         s_encGroup = nullptr;
@@ -381,7 +575,7 @@ void Song_destroy(lv_obj_t* root)
 }
 
 // Auto-registration: the app shows up in the launcher with no wiring anywhere
-// else. The last argument names the pad logic registered above.
-REGISTER_APP_PL(Song, nullptr, "song.png",
-                Song_create, Song_destroy,
-                nullptr, nullptr, nullptr, 0, "Song")
+// else. No pad logic: the pads stay the Sampler's and play while the song runs.
+REGISTER_APP(Song, nullptr, "song.png",
+             Song_create, Song_destroy,
+             nullptr, nullptr, nullptr, 0)
