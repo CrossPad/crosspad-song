@@ -34,6 +34,7 @@
 
 #include "lvgl.h"
 
+#include <cstdarg>
 #include <cstdio>
 
 // Encoder navigation is an embedded-only concern -- the simulator drives the UI
@@ -48,6 +49,33 @@ extern "C" {
 #endif
 
 namespace {
+
+/* ── set_text_fmt() is not used here, and this is why ─────────────
+ *
+ * It frees the label's old text and allocates the new one, but it does not
+ * revert the dots of a truncated label first -- lv_label_set_text() does
+ * exactly that, one line in, "in case text == label->text". So when a long
+ * line is replaced by a shorter one, LVGL still holds the offset the dots were
+ * written at, and on the next refresh it puts the four saved characters back at
+ * that offset -- past the end of the new, shorter buffer. The heap block next
+ * door loses its tail canary, and the crash lands minutes later on whatever
+ * frees that block: an assert deep inside LVGL, with nothing in the backtrace
+ * to say who wrote the bytes. It read as "Arrange crashes when I click a
+ * block", because this screen is the one that formats a line of changing length
+ * on every click.
+ *
+ * Formatting it ourselves and handing lv_label_set_text() a finished string is
+ * both the safe way and what every other screen in this firmware does. */
+static void set_text_fmt(lv_obj_t* label, const char* fmt, ...)
+{
+    if (!label || !fmt) return;
+    char buf[160];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    lv_label_set_text(label, buf);
+}
 
 constexpr int32_t  kPxPerBar  = 12;
 constexpr int32_t  kRulerH    = 12;
@@ -138,7 +166,7 @@ void update_info()
     for (uint8_t i = 0; i < n; ++i) { Block b; block_at(i, b); total += block_bars(b); }
     Block b;
     if (n && block_at(s_sel, b)) {
-        lv_label_set_text_fmt(s_infoLabel, "Block %u  -  Seq %u x%u  -  %d bars   |   song %d bars",
+        set_text_fmt(s_infoLabel, "Block %u  -  Seq %u x%u  -  %d bars   |   song %d bars",
                               (unsigned)(s_sel + 1), (unsigned)(b.scene + 1), (unsigned)b.repeats,
                               (int)block_bars(b), (int)total);
     } else {
@@ -240,7 +268,7 @@ void rebuild_timeline()
         lv_obj_set_style_text_color(l, kInk, 0);
         lv_label_set_long_mode(l, LV_LABEL_LONG_CLIP);
         lv_obj_set_width(l, LV_PCT(100));
-        lv_label_set_text_fmt(l, "S%u\nx%u", (unsigned)(b.scene + 1), (unsigned)b.repeats);
+        set_text_fmt(l, "S%u\nx%u", (unsigned)(b.scene + 1), (unsigned)b.repeats);
 
         /* A tick per pass, so x4 looks like four of something. */
         for (uint8_t r = 1; r < b.repeats; ++r) {
@@ -270,7 +298,7 @@ void rebuild_timeline()
             lv_obj_t* num = lv_label_create(s_timeline);
             lv_obj_set_style_text_font(num, &lv_font_montserrat_10, 0);
             lv_obj_set_style_text_color(num, kDim, 0);
-            lv_label_set_text_fmt(num, "%d", (int)(bar + 1));
+            set_text_fmt(num, "%d", (int)(bar + 1));
             lv_obj_set_pos(num, bar * kPxPerBar + 2, -2);
         }
     }
@@ -333,12 +361,12 @@ void tick_cb(lv_timer_t*)
     if (!s_playhead) return;
     if (!playing) {
         lv_obj_add_flag(s_playhead, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text_fmt(s_posLabel, "%d bars", (int)total);
+        set_text_fmt(s_posLabel, "%d bars", (int)total);
         return;
     }
     lv_obj_remove_flag(s_playhead, LV_OBJ_FLAG_HIDDEN);
     lv_obj_set_pos(s_playhead, at, 0);
-    lv_label_set_text_fmt(s_posLabel, "bar %d / %d", (int)(at / kPxPerBar + 1), (int)total);
+    set_text_fmt(s_posLabel, "bar %d / %d", (int)(at / kPxPerBar + 1), (int)total);
 
     /* Follow the playhead: once it passes two thirds of the view, page on. */
     const int32_t view = lv_obj_get_content_width(s_timeline);
