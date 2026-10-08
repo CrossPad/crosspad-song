@@ -9,9 +9,12 @@
  * playhead running across while it plays.
  *
  * The arrangement lives in the sequencer (crosspad-core) and is saved with the
- * kit's sequences; this app only draws and edits it. Play here is song mode:
- * the sequencer walks the blocks, changing scene on the bar line. Stop ends
- * song mode, so the Sampler's own Play keeps meaning "loop this scene".
+ * kit's sequences; this app only draws and edits it. PLAY on the transport bar
+ * is song mode while this screen holds the transport: the sequencer walks the
+ * blocks, changing scene on the bar line (UX 2000 section 6, screen 3).
+ *
+ * The encoder edits the selected block: turn = its scene, click = its repeats,
+ * click again = the next block. A tap on a block selects it.
  *
  * The pads stay the Sampler's: no pad logic of its own, so they play the kit
  * while the song runs.
@@ -30,6 +33,8 @@
 #include "crosspad/app/AppRegistrar.hpp"
 #include "crosspad/platform/PlatformServices.hpp"
 #include "crosspad/sequencer/SequencerController.hpp"
+#include "crosspad/transport/BlockSongTransport.hpp"
+#include "crosspad-gui/components/transport_bar.h"
 #include "crosspad-gui/widgets/gui_helpers.h"
 
 #include "lvgl.h"
@@ -84,34 +89,42 @@ constexpr int32_t  kBlockGap  = 2;
 constexpr uint32_t kTickMs    = 50;
 constexpr uint8_t  kMaxBlocks = 32;
 
+/* A screen y as a y inside the root, which begins under the transport bar:
+ * the screen is laid out on the template's bands (context row at 34, content
+ * from 60, soft keys at 206). */
+#define SONG_Y(v) ((v) - TRANSPORT_BAR_HEIGHT)
+
 const lv_color_t kBg      = lv_color_hex(0x16181B);
 const lv_color_t kPanel   = lv_color_hex(0x20242A);
+const lv_color_t kWell    = lv_color_hex(0x1B1E22);
 const lv_color_t kInk     = lv_color_hex(0x16181B);
 const lv_color_t kText    = lv_color_hex(0xE8EAED);
 const lv_color_t kDim     = lv_color_hex(0x7B828B);
 const lv_color_t kAccent  = lv_color_hex(0xC6FF47);
 const lv_color_t kHead    = lv_color_hex(0xFFFFFF);
+const lv_color_t kMint    = lv_color_hex(0x00FF88);
 
 /// A scene's colour, the same for every block of it, so a repeat of Seq 1
 /// reads as Seq 1 at a glance anywhere on the timeline.
 const uint32_t kSceneColors[] = {
-    0xC6FF47, 0x5AC8FF, 0xFFC857, 0xFF7A9A, 0xB48CFF, 0xFF9552, 0x4FE0B0, 0x7AA2FF,
+    0xC6FF47, 0x4EA6D3, 0xFFC857, 0xFF7A9A, 0xB48CFF, 0xFF9552, 0x4FE0B0, 0x7AA2FF,
 };
 
+/// What the encoder turns on the selected block.
+enum class Part : uint8_t { Scene, Repeats };
+
 lv_obj_t* s_root      = nullptr;
-lv_obj_t* s_timeline  = nullptr;   // scrolls horizontally: ruler, blocks, playhead
+lv_obj_t* s_timeline  = nullptr;   // the field the encoder edits; scrolls horizontally
 lv_obj_t* s_playhead  = nullptr;
 lv_obj_t* s_posLabel  = nullptr;
 lv_obj_t* s_infoLabel = nullptr;
-lv_obj_t* s_playBtn   = nullptr;
-lv_obj_t* s_playLabel = nullptr;
 lv_obj_t* s_loopBtn   = nullptr;
 lv_obj_t* s_blocks[kMaxBlocks] = {};
-lv_obj_t* s_tools[6] = {};
-lv_obj_t* s_backBtn   = nullptr;
+lv_obj_t* s_keys[3] = {};
 lv_timer_t* s_timer   = nullptr;
 
 uint8_t  s_sel = 0;
+Part     s_part = Part::Scene;
 uint32_t s_shape = 0;      // what the timeline was last built from
 int      s_playing = -1;   // block drawn as playing, -1 none
 
@@ -138,8 +151,16 @@ bool block_at(uint8_t i, Block& b)
 
 int32_t block_bars(const Block& b) { return (int32_t)b.repeats * b.bars; }
 
+int32_t song_bars()
+{
+    auto* sq = seq();
+    int32_t total = 0;
+    for (uint8_t i = 0; sq && i < sq->getSongLength(); ++i) { Block b; block_at(i, b); total += block_bars(b); }
+    return total;
+}
+
 /// Everything the drawing depends on, folded into one word: when it changes
-/// -- an edit here, a kit load, a scene's length changed in the Sampler --
+/// -- an edit here, a kit load, a scene's length changed in the Sequencer --
 /// the timeline is rebuilt.
 uint32_t song_shape()
 {
@@ -161,16 +182,13 @@ void update_info()
 {
     auto* sq = seq();
     if (!sq || !s_infoLabel) return;
-    const uint8_t n = sq->getSongLength();
-    int32_t total = 0;
-    for (uint8_t i = 0; i < n; ++i) { Block b; block_at(i, b); total += block_bars(b); }
     Block b;
-    if (n && block_at(s_sel, b)) {
-        set_text_fmt(s_infoLabel, "Block %u  -  Seq %u x%u  -  %d bars   |   song %d bars",
-                              (unsigned)(s_sel + 1), (unsigned)(b.scene + 1), (unsigned)b.repeats,
-                              (int)block_bars(b), (int)total);
+    if (sq->getSongLength() && block_at(s_sel, b)) {
+        set_text_fmt(s_infoLabel, "Block %u  -  Seq %u x%u  -  %d bars",
+                     (unsigned)(s_sel + 1), (unsigned)(b.scene + 1), (unsigned)b.repeats,
+                     (int)block_bars(b));
     } else {
-        lv_label_set_text(s_infoLabel, "Empty song -- ADD puts the first block in");
+        lv_label_set_text(s_infoLabel, "Empty song -- + ADD puts the first block in");
     }
 }
 
@@ -180,16 +198,27 @@ void paint_block(uint8_t i)
     if (!o) return;
     const bool sel = i == s_sel;
     const bool playing = (int)i == s_playing;
-    lv_obj_set_style_outline_width(o, sel ? 2 : 0, 0);
-    lv_obj_set_style_outline_color(o, kHead, 0);
-    lv_obj_set_style_outline_pad(o, 1, 0);
-    lv_obj_set_style_bg_opa(o, playing ? LV_OPA_COVER : LV_OPA_80, 0);
-    lv_obj_set_style_border_width(o, playing ? 3 : 0, 0);
-    lv_obj_set_style_border_side(o, LV_BORDER_SIDE_TOP, 0);
+    lv_obj_set_style_border_width(o, sel ? 2 : 0, 0);
     lv_obj_set_style_border_color(o, kHead, 0);
+    lv_obj_set_style_bg_opa(o, playing ? LV_OPA_COVER : LV_OPA_80, 0);
 }
 
-void select_block(uint8_t i)
+void label_block(uint8_t i)
+{
+    lv_obj_t* o = s_blocks[i];
+    Block b;
+    if (!o || !block_at(i, b)) return;
+    lv_obj_t* l = lv_obj_get_child(o, 0);
+    if (!l) return;
+    /* Which of its two numbers the encoder turns: the other one is dimmed. */
+    const bool sel = i == s_sel;
+    lv_label_set_recolor(l, true);
+    if (!sel)                   set_text_fmt(l, "S%u\nx%u", (unsigned)(b.scene + 1), (unsigned)b.repeats);
+    else if (s_part == Part::Scene) set_text_fmt(l, "S%u\n#444444 x%u#", (unsigned)(b.scene + 1), (unsigned)b.repeats);
+    else                        set_text_fmt(l, "#444444 S%u#\nx%u", (unsigned)(b.scene + 1), (unsigned)b.repeats);
+}
+
+void select_block(uint8_t i, Part part)
 {
     auto* sq = seq();
     const uint8_t n = sq ? sq->getSongLength() : 0;
@@ -197,39 +226,19 @@ void select_block(uint8_t i)
     if (i >= n) i = (uint8_t)(n - 1);
     const uint8_t prev = s_sel;
     s_sel = i;
-    if (prev < n) paint_block(prev);
+    s_part = part;
+    /* Choosing a block is choosing where PLAY on the bar starts. */
+    if (auto* t = crosspad::blockSongTransport()) t->setStartBlock(i);
+    if (prev < n) { paint_block(prev); label_block(prev); }
     paint_block(i);
+    label_block(i);
     if (s_blocks[i]) lv_obj_scroll_to_view(s_blocks[i], LV_ANIM_ON);
     update_info();
 }
 
-void block_focused_cb(lv_event_t* e)
+void block_clicked_cb(lv_event_t* e)
 {
-    select_block((uint8_t)(uintptr_t)lv_event_get_user_data(e));
-}
-
-/// The encoder group in screen order: top bar, blocks left to right, tools.
-/// Rebuilt with the blocks, since a group only ever appends.
-void rebuild_group()
-{
-#ifdef SONG_USE_ENCODER
-    if (!s_encGroup) return;
-    lv_obj_t* focused = lv_group_get_focused(s_encGroup);
-    lv_group_remove_all_objs(s_encGroup);
-    lv_group_add_obj(s_encGroup, s_backBtn);
-    lv_group_add_obj(s_encGroup, s_loopBtn);
-    lv_group_add_obj(s_encGroup, s_playBtn);
-    for (auto* b : s_blocks) if (b) lv_group_add_obj(s_encGroup, b);
-    for (auto* t : s_tools) if (t) lv_group_add_obj(s_encGroup, t);
-    /* Keep the cursor where it was; on a block that just went, the new
-     * selection. */
-    bool alive = false;
-    for (uint32_t k = 0; k < lv_group_get_obj_count(s_encGroup); ++k) {
-        if (lv_group_get_obj_by_index(s_encGroup, k) == focused) { alive = true; break; }
-    }
-    if (alive) lv_group_focus_obj(focused);
-    else if (s_blocks[s_sel]) lv_group_focus_obj(s_blocks[s_sel]);
-#endif
+    select_block((uint8_t)(uintptr_t)lv_event_get_user_data(e), Part::Scene);
 }
 
 void rebuild_timeline()
@@ -258,9 +267,7 @@ void rebuild_timeline()
         lv_obj_set_style_pad_all(o, 3, 0);
         lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_flag(o, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_flag(o, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
-        lv_obj_add_event_cb(o, block_focused_cb, LV_EVENT_FOCUSED, (void*)(uintptr_t)i);
-        lv_obj_add_event_cb(o, block_focused_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)i);
+        lv_obj_add_event_cb(o, block_clicked_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)i);
 
         /* Scene over repeats, top-left, clipped when the block is short. */
         lv_obj_t* l = lv_label_create(o);
@@ -268,7 +275,6 @@ void rebuild_timeline()
         lv_obj_set_style_text_color(l, kInk, 0);
         lv_label_set_long_mode(l, LV_LABEL_LONG_CLIP);
         lv_obj_set_width(l, LV_PCT(100));
-        set_text_fmt(l, "S%u\nx%u", (unsigned)(b.scene + 1), (unsigned)b.repeats);
 
         /* A tick per pass, so x4 looks like four of something. */
         for (uint8_t r = 1; r < b.repeats; ++r) {
@@ -294,6 +300,7 @@ void rebuild_timeline()
         lv_obj_set_style_bg_color(t, kDim, 0);
         lv_obj_set_style_bg_opa(t, LV_OPA_COVER, 0);
         lv_obj_set_pos(t, bar * kPxPerBar, kRulerH - (bar % 4 ? 3 : 6));
+        lv_obj_remove_flag(t, LV_OBJ_FLAG_CLICKABLE);
         if (bar % 4 == 0) {
             lv_obj_t* num = lv_label_create(s_timeline);
             lv_obj_set_style_text_font(num, &lv_font_montserrat_10, 0);
@@ -306,25 +313,20 @@ void rebuild_timeline()
     s_playhead = lv_obj_create(s_timeline);
     lv_obj_remove_style_all(s_playhead);
     lv_obj_set_size(s_playhead, 2, kRulerH + kBlockH + 4);
-    lv_obj_set_style_bg_color(s_playhead, kHead, 0);
+    lv_obj_set_style_bg_color(s_playhead, kMint, 0);
     lv_obj_set_style_bg_opa(s_playhead, LV_OPA_COVER, 0);
     lv_obj_add_flag(s_playhead, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(s_playhead, LV_OBJ_FLAG_CLICKABLE);
 
     s_shape = song_shape();
-    rebuild_group();
-    select_block(s_sel);
+    for (uint8_t i = 0; i < kMaxBlocks; ++i) { paint_block(i); label_block(i); }
+    select_block(s_sel, s_part);
 }
 
-void sync_transport()
+void paint_loop()
 {
     auto* sq = seq();
-    if (!sq) return;
-    const bool running = sq->getState() == crosspad::SequencerState::Running;
-    const bool song = running && sq->getSongMode();
-    lv_label_set_text(s_playLabel, song ? LV_SYMBOL_STOP : LV_SYMBOL_PLAY);
-    lv_obj_set_style_bg_color(s_playBtn, song ? kAccent : kPanel, 0);
-    lv_obj_set_style_text_color(s_playLabel, song ? kInk : kText, 0);
+    if (!sq || !s_loopBtn) return;
     const bool loop = sq->getSongLoop();
     lv_obj_set_style_bg_color(s_loopBtn, loop ? kAccent : kPanel, 0);
     lv_obj_set_style_text_color(lv_obj_get_child(s_loopBtn, 0), loop ? kInk : kDim, 0);
@@ -335,7 +337,7 @@ void tick_cb(lv_timer_t*)
     auto* sq = seq();
     if (!sq) return;
     if (song_shape() != s_shape) rebuild_timeline();
-    sync_transport();
+    paint_loop();
 
     const bool playing = sq->getState() == crosspad::SequencerState::Running && sq->getSongMode();
     const int now = playing ? sq->getSongPosition() : -1;
@@ -346,7 +348,7 @@ void tick_cb(lv_timer_t*)
         if (now >= 0 && now < kMaxBlocks) paint_block((uint8_t)now);
     }
 
-    int32_t total = 0, at = 0;
+    int32_t at = 0;
     for (uint8_t i = 0; i < sq->getSongLength(); ++i) {
         Block b;
         block_at(i, b);
@@ -355,8 +357,8 @@ void tick_cb(lv_timer_t*)
             const float into = (float)sq->getSongPass() * b.bars + sq->getProgress() * b.bars;
             at = at * kPxPerBar + (int32_t)(into * kPxPerBar);
         }
-        total += block_bars(b);
     }
+    const int32_t total = song_bars();
 
     if (!s_playhead) return;
     if (!playing) {
@@ -378,27 +380,10 @@ void tick_cb(lv_timer_t*)
 
 // ── actions ────────────────────────────────────────────────────────────────
 
-void play_cb(lv_event_t*)
-{
-    auto* sq = seq();
-    if (!sq) return;
-    if (sq->getState() == crosspad::SequencerState::Running && sq->getSongMode()) {
-        sq->stop();                          // ends song mode too
-    } else if (sq->getSongLength()) {
-        if (sq->getState() == crosspad::SequencerState::Running) sq->stop();
-        /* Song mode first: switched on while stopped it locates the first
-         * block, which would undo the locate. */
-        sq->setSongMode(true);
-        sq->songLocate(s_sel);               // from the selected block
-        sq->playback();
-    }
-    sync_transport();
-}
-
 void loop_cb(lv_event_t*)
 {
     if (auto* sq = seq()) sq->setSongLoop(!sq->getSongLoop());
-    sync_transport();
+    paint_loop();
 }
 
 void edit_selected(int dScene, int dRepeats)
@@ -415,10 +400,31 @@ void edit_selected(int dScene, int dRepeats)
     rebuild_timeline();
 }
 
-void scene_down_cb(lv_event_t*) { edit_selected(-1, 0); }
-void scene_up_cb(lv_event_t*)   { edit_selected(+1, 0); }
-void reps_down_cb(lv_event_t*)  { edit_selected(0, -1); }
-void reps_up_cb(lv_event_t*)    { edit_selected(0, +1); }
+/// The timeline is the field: a click puts it in edit mode, where turning
+/// changes the selected block's scene or repeats and a click moves from scene
+/// to repeats and on to the next block.
+void timeline_cb(lv_event_t* e)
+{
+    const lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_KEY) {
+        const uint32_t key = lv_event_get_key(e);
+        const int d = (key == LV_KEY_RIGHT || key == LV_KEY_UP) ? 1
+                    : (key == LV_KEY_LEFT || key == LV_KEY_DOWN) ? -1 : 0;
+        if (!d) return;
+        if (s_part == Part::Scene) edit_selected(d, 0);
+        else                       edit_selected(0, d);
+        return;
+    }
+    if (code == LV_EVENT_CLICKED) {
+        lv_indev_t* in = lv_indev_active();
+        if (!in || lv_indev_get_type(in) != LV_INDEV_TYPE_ENCODER) return;
+        auto* sq = seq();
+        const uint8_t n = sq ? sq->getSongLength() : 0;
+        if (!n) return;
+        if (s_part == Part::Scene) select_block(s_sel, Part::Repeats);
+        else                       select_block((uint8_t)((s_sel + 1) % n), Part::Scene);
+    }
+}
 
 /// After the selected block, the same scene once: the next part of a song is
 /// most often more of the same, and it is one press to change.
@@ -431,6 +437,17 @@ void add_cb(lv_event_t*)
     const uint8_t scene = (n && block_at(s_sel, b)) ? b.scene : 0;
     const uint8_t at = n ? (uint8_t)(s_sel + 1) : 0;
     if (sq->songInsert(at, scene, 1)) s_sel = at;
+    s_part = Part::Scene;
+    rebuild_timeline();
+}
+
+/// A copy of the selected block, straight after it.
+void dup_cb(lv_event_t*)
+{
+    auto* sq = seq();
+    Block b;
+    if (!sq || !block_at(s_sel, b)) return;
+    if (sq->songInsert((uint8_t)(s_sel + 1), b.scene, b.repeats)) s_sel = (uint8_t)(s_sel + 1);
     rebuild_timeline();
 }
 
@@ -443,43 +460,33 @@ void del_cb(lv_event_t*)
     rebuild_timeline();
 }
 
-// Closing the app from inside the app. Never call destroyApp() straight from
-// an event callback: it deletes the widget tree this very event belongs to.
-void back_cb(lv_event_t* e)
-{
-    auto* app = static_cast<App*>(lv_event_get_user_data(e));
-    if (app) app->destroyAppAsync();
-}
-
-lv_obj_t* make_button(lv_obj_t* parent, int32_t w, const char* text, lv_event_cb_t cb, void* ud = nullptr)
+lv_obj_t* make_button(lv_obj_t* parent, int32_t w, int32_t h, const lv_font_t* font,
+                      const char* text, lv_event_cb_t cb)
 {
     lv_obj_t* b = lv_button_create(parent);
-    lv_obj_set_size(b, w, 22);
+    lv_obj_set_size(b, w, h);
     lv_obj_set_style_pad_all(b, 0, 0);
     lv_obj_set_style_radius(b, 6, 0);
     lv_obj_set_style_shadow_width(b, 0, 0);
     lv_obj_set_style_bg_color(b, kPanel, 0);
     lv_obj_set_style_outline_color(b, kHead, LV_STATE_FOCUS_KEY);
     lv_obj_set_style_outline_width(b, 2, LV_STATE_FOCUS_KEY);
-    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, ud);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_t* l = lv_label_create(b);
-    lv_obj_set_style_text_font(l, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_font(l, font, 0);
     lv_obj_set_style_text_color(l, kText, 0);
     lv_label_set_text(l, text);
     lv_obj_center(l);
     return b;
 }
 
-lv_obj_t* make_row(lv_obj_t* parent, int32_t h)
+lv_obj_t* make_label(lv_obj_t* parent, const lv_font_t* font, lv_color_t col, const char* text)
 {
-    lv_obj_t* r = lv_obj_create(parent);
-    lv_obj_remove_style_all(r);
-    lv_obj_set_size(r, LV_PCT(100), h);
-    lv_obj_set_flex_flow(r, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(r, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(r, 4, 0);
-    lv_obj_remove_flag(r, LV_OBJ_FLAG_SCROLLABLE);
-    return r;
+    lv_obj_t* l = lv_label_create(parent);
+    lv_obj_set_style_text_font(l, font, 0);
+    lv_obj_set_style_text_color(l, col, 0);
+    lv_label_set_text(l, text);
+    return l;
 }
 
 } // namespace
@@ -493,75 +500,77 @@ lv_obj_t* Song_create(lv_obj_t* parent, App* app)
 #endif
 
     s_root = lv_obj_create(parent);
+    lv_obj_remove_style_all(s_root);
     lv_obj_set_size(s_root, LV_PCT(100), LV_PCT(100));
     lv_obj_set_style_bg_color(s_root, kBg, 0);
-    lv_obj_set_style_border_width(s_root, 0, 0);
-    lv_obj_set_style_radius(s_root, 0, 0);
-    lv_obj_set_style_pad_all(s_root, 6, 0);
-    lv_obj_set_style_pad_row(s_root, 5, 0);
-    lv_obj_set_flex_flow(s_root, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_bg_opa(s_root, LV_OPA_COVER, 0);
     lv_obj_remove_flag(s_root, LV_OBJ_FLAG_SCROLLABLE);
 
-    // -- top bar: out, what this is, where the song is, loop, play --
-    lv_obj_t* bar = make_row(s_root, 22);
-    s_backBtn = make_button(bar, 30, LV_SYMBOL_LEFT, back_cb, app);
+    // -- context row: what this is, how long, LOOP --
+    lv_obj_t* title = make_label(s_root, &lv_font_montserrat_16, kText, "Song");
+    lv_obj_set_pos(title, 8, SONG_Y(36));
+    s_posLabel = make_label(s_root, &lv_font_montserrat_10, kDim, "");
+    lv_obj_set_pos(s_posLabel, 66, SONG_Y(41));
+    s_loopBtn = make_button(s_root, 56, 22, &lv_font_montserrat_14, "LOOP", loop_cb);
+    lv_obj_set_pos(s_loopBtn, 258, SONG_Y(34));
 
-    lv_obj_t* title = lv_label_create(bar);
-    lv_obj_set_style_text_color(title, kText, 0);
-    lv_label_set_text(title, "Song");
-
-    s_posLabel = lv_label_create(bar);
-    lv_obj_set_style_text_font(s_posLabel, &lv_font_montserrat_10, 0);
-    lv_obj_set_style_text_color(s_posLabel, kDim, 0);
-    lv_obj_set_flex_grow(s_posLabel, 1);
-    lv_obj_set_style_text_align(s_posLabel, LV_TEXT_ALIGN_RIGHT, 0);
-    lv_label_set_text(s_posLabel, "");
-
-    s_loopBtn = make_button(bar, 40, "LOOP", loop_cb);
-    s_playBtn = make_button(bar, 40, LV_SYMBOL_PLAY, play_cb);
-    s_playLabel = lv_obj_get_child(s_playBtn, 0);
-
-    // -- the timeline --
-    s_timeline = lv_obj_create(s_root);
+    // -- the timeline: the field the encoder edits --
+    s_timeline = lv_CreateEditableButton(s_root);
     lv_obj_remove_style_all(s_timeline);
-    lv_obj_set_width(s_timeline, LV_PCT(100));
-    lv_obj_set_height(s_timeline, kRulerH + kBlockH + 8);
-    lv_obj_set_style_bg_color(s_timeline, kPanel, 0);
+    lv_obj_set_pos(s_timeline, 6, SONG_Y(60));
+    lv_obj_set_size(s_timeline, 308, kRulerH + kBlockH + 8);
+    lv_obj_set_style_bg_color(s_timeline, kWell, 0);
     lv_obj_set_style_bg_opa(s_timeline, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(s_timeline, 6, 0);
     lv_obj_set_style_pad_hor(s_timeline, 4, 0);
     lv_obj_set_style_pad_top(s_timeline, 2, 0);
+    lv_obj_set_style_outline_color(s_timeline, kHead, LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_outline_width(s_timeline, 1, LV_STATE_FOCUS_KEY);
+    lv_obj_add_flag(s_timeline, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scroll_dir(s_timeline, LV_DIR_HOR);
     lv_obj_set_scrollbar_mode(s_timeline, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_add_event_cb(s_timeline, timeline_cb, LV_EVENT_KEY, nullptr);
+    lv_obj_add_event_cb(s_timeline, timeline_cb, LV_EVENT_CLICKED, nullptr);
 
-    s_infoLabel = lv_label_create(s_root);
-    lv_obj_set_style_text_font(s_infoLabel, &lv_font_montserrat_10, 0);
-    lv_obj_set_style_text_color(s_infoLabel, kDim, 0);
+    s_infoLabel = make_label(s_root, &lv_font_montserrat_10, kDim, "");
+    lv_obj_set_pos(s_infoLabel, 8, SONG_Y(148));
+    lv_obj_set_width(s_infoLabel, 304);
     lv_label_set_long_mode(s_infoLabel, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(s_infoLabel, LV_PCT(100));
+    lv_obj_t* hint = make_label(s_root, &lv_font_montserrat_10, kAccent,
+                                "turn = sequence  -  click = repeats");
+    lv_obj_set_pos(hint, 8, SONG_Y(164));
 
-    // -- tools: act on the selected block --
-    lv_obj_t* tools = make_row(s_root, 26);
-    lv_obj_set_style_pad_column(tools, 3, 0);
-    s_tools[0] = make_button(tools, 46, "S -", scene_down_cb);
-    s_tools[1] = make_button(tools, 46, "S +", scene_up_cb);
-    s_tools[2] = make_button(tools, 46, "x -", reps_down_cb);
-    s_tools[3] = make_button(tools, 46, "x +", reps_up_cb);
-    s_tools[4] = make_button(tools, 50, "ADD", add_cb);
-    s_tools[5] = make_button(tools, 50, "DEL", del_cb);
+    // -- soft keys: on the selected block --
+    static const struct { const char* text; lv_event_cb_t cb; } kKeys[3] = {
+        { "+ ADD", add_cb }, { "DUP", dup_cb }, { "DEL", del_cb },
+    };
+    constexpr int32_t kKeyW = (308 - 2 * 4) / 3;
+    for (int i = 0; i < 3; ++i) {
+        s_keys[i] = make_button(s_root, kKeyW, 30, &lv_font_montserrat_14, kKeys[i].text, kKeys[i].cb);
+        lv_obj_set_pos(s_keys[i], 6 + i * (kKeyW + 4), SONG_Y(206));
+    }
 
     lv_obj_update_layout(s_root);
     rebuild_timeline();
-    sync_transport();
+    paint_loop();
 
 #ifdef SONG_USE_ENCODER
-    if (s_encGroup) lv_group_focus_obj(s_blocks[s_sel] ? s_blocks[s_sel] : s_playBtn);
+    if (s_encGroup) {
+        lv_group_add_obj(s_encGroup, s_timeline);
+        for (auto* k : s_keys) lv_group_add_obj(s_encGroup, k);
+        lv_group_add_obj(s_encGroup, s_loopBtn);
+        lv_group_focus_obj(s_timeline);
+    }
 #endif
 
     s_timer = lv_timer_create(tick_cb, kTickMs, nullptr);
 
     if (app) {
         app->setOnShow([](lv_obj_t*) {
+            /* PLAY on the bar plays this song while this screen is up, and
+             * after it: a claim outlives its screen. */
+            crosspad::transportClaim(crosspad::blockSongTransport());
+            crosspad_gui::transportbar_refresh();
             if (s_timer) lv_timer_resume(s_timer);
 #ifdef SONG_USE_ENCODER
             if (indev_encoderTop && s_encGroup) lv_indev_set_group(indev_encoderTop, s_encGroup);
@@ -585,14 +594,14 @@ void Song_destroy(lv_obj_t* root)
         s_timer = nullptr;
     }
     for (auto& b : s_blocks) b = nullptr;
-    for (auto& t : s_tools) t = nullptr;
+    for (auto& k : s_keys) k = nullptr;
     s_root = s_timeline = s_playhead = s_posLabel = s_infoLabel = nullptr;
-    s_playBtn = s_playLabel = s_loopBtn = s_backBtn = nullptr;
+    s_loopBtn = nullptr;
     s_playing = -1;
 
 #ifdef SONG_USE_ENCODER
-    // Hand navigation back before the group dies, or the launcher comes back
-    // unnavigable and only a reboot fixes it.
+    // Hand navigation back before the group dies, or the screen behind comes
+    // back unnavigable and only a reboot fixes it.
     if (indev_encoderTop && s_prevEncGroup) lv_indev_restore_group(indev_encoderTop, s_prevEncGroup);
     if (s_encGroup) {
         lv_group_delete(s_encGroup);
@@ -604,8 +613,8 @@ void Song_destroy(lv_obj_t* root)
     lv_obj_delete_async(root);
 }
 
-// Auto-registration: the app shows up in the launcher with no wiring anywhere
-// else. No pad logic: the pads stay the Sampler's and play while the song runs.
+// Auto-registration: no pad logic -- the pads stay the Sampler's and play
+// while the song runs.
 REGISTER_APP(Song, nullptr, "song.png",
              Song_create, Song_destroy,
              nullptr, nullptr, nullptr, 0)
