@@ -610,7 +610,7 @@ void Song_destroy(lv_obj_t* root)
     s_prevEncGroup = nullptr;
 #endif
 
-    lv_obj_delete_async(root);
+    if (root) lv_obj_delete_async(root);
 }
 
 // Auto-registration: no pad logic -- the pads stay the Sampler's and play
