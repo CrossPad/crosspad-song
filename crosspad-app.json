@@ -1,7 +1,7 @@
 {
   "name": "Song",
   "id": "song",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Arrange scenes on a timeline",
   "category": "music",
   "icon": "song.png",
@@ -11,10 +11,11 @@
     "pc"
   ],
   "requires": {
-    "crosspad-core": ">=1.21.0",
-    "crosspad-gui": ">=1.12.0"
+    "crosspad-core": "^2.0.0",
+    "crosspad-gui": "^2.0.0"
   },
   "changelog": [
+    "0.3.0: the Song screen on the transport bar -- PLAY there is song mode while this screen holds the transport, and the encoder edits the selected block (turn: its scene, click: its repeats, click again: the next block); a root deleted before the app's teardown is handled (gui 2.0 calls destroy with none); requires core 2.0 and gui 2.0",
     "0.2.0: requires core 1.21 (song blocks) and gui 1.12",
     "0.1.0: Generated from the CrossPad app template"
   ]
