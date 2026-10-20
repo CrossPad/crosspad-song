@@ -1,12 +1,12 @@
 {
     "name": "crosspad-song",
-    "version": "0.2.0",
+    "version": "0.3.0",
     "license": "GPL-3.0-or-later",
     "description": "Arrange scenes on a timeline",
     "keywords": ["crosspad", "song", "lvgl", "pad"],
     "dependencies": {
-        "crosspad-core": "*",
-        "crosspad-gui": "*"
+        "crosspad-core": ">=1.70.0,<3.0.0",
+        "crosspad-gui": ">=1.28.0,<3.0.0"
     },
     "build": {
         "appLibrary": true
