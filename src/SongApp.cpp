@@ -91,8 +91,13 @@ constexpr uint8_t  kMaxBlocks = 32;
 
 /* A screen y as a y inside the root, which begins under the transport bar:
  * the screen is laid out on the template's bands (context row at 34, content
- * from 60, soft keys at 206). */
-#define SONG_Y(v) ((v) - TRANSPORT_BAR_HEIGHT)
+ * from 60, soft keys at 204), drawn under a 30 px bar. Under the 40 px bar
+ * (crosspad-gui 2.4) the root is 200 px, not 210: the template's 34 lands
+ * 1 px under the bar and the soft keys are 28 px from 204, so they end on
+ * the root's 198; subtracting the bar's own height put the context row 6 px
+ * under it. Arrange (kExportTop) and PitchPlay do the same. */
+constexpr int32_t kTemplateTop = 33;
+#define SONG_Y(v) ((v) - kTemplateTop)
 
 const lv_color_t kBg      = lv_color_hex(0x16181B);
 const lv_color_t kPanel   = lv_color_hex(0x20242A);
@@ -546,8 +551,8 @@ lv_obj_t* Song_create(lv_obj_t* parent, App* app)
     };
     constexpr int32_t kKeyW = (308 - 2 * 4) / 3;
     for (int i = 0; i < 3; ++i) {
-        s_keys[i] = make_button(s_root, kKeyW, 30, &lv_font_montserrat_14, kKeys[i].text, kKeys[i].cb);
-        lv_obj_set_pos(s_keys[i], 6 + i * (kKeyW + 4), SONG_Y(206));
+        s_keys[i] = make_button(s_root, kKeyW, 28, &lv_font_montserrat_14, kKeys[i].text, kKeys[i].cb);
+        lv_obj_set_pos(s_keys[i], 6 + i * (kKeyW + 4), SONG_Y(204));
     }
 
     lv_obj_update_layout(s_root);

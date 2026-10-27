@@ -1,7 +1,7 @@
 {
   "name": "Song",
   "id": "song",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Arrange scenes on a timeline",
   "category": "music",
   "icon": "song.png",
@@ -15,6 +15,7 @@
     "crosspad-gui": ">=1.28.0,<3.0.0"
   },
   "changelog": [
+    "0.3.1: fits under the 40 px top bar (crosspad-gui 2.4): the title and LOOP sat 4-6 px under it, because the screen is laid out from the template's 30 px bar and shifted by the bar's own height. The context row is 1 px under the bar; the soft keys are 28 px tall from the template's 204, so the screen still ends inside its 200 px, as in Arrange 0.19.1.",
     "0.3.0: the Song screen on the transport bar -- PLAY there is song mode while this screen holds the transport, and the encoder edits the selected block (turn: its scene, click: its repeats, click again: the next block); a root deleted before the app's teardown is handled (gui 2.0 calls destroy with none); builds on core 1.70+/gui 1.28+ and on core/gui 2.x (>=1.70.0,<3.0.0 and >=1.28.0,<3.0.0) for the merge window",
     "0.2.0: requires core 1.21 (song blocks) and gui 1.12",
     "0.1.0: Generated from the CrossPad app template"
